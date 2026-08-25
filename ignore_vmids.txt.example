@@ -1,0 +1,3 @@
+# One Proxmox VMID per line to exclude from the "VM not running"/"agent no
+# ping" checks (e.g. templates, intentionally-stopped VMs). Real file lives
+# at /etc/server-watch/ignore_vmids.txt, not tracked in git.
