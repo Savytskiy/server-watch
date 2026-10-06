@@ -7,6 +7,14 @@ DATA_DIR=/var/lib/server-watch
 STATE_FILE="$DATA_DIR/state.tsv"
 IGNORE_VMIDS_FILE="$CONF_DIR/ignore_vmids.txt"
 ENV_FILE="$CONF_DIR/config.env"
+# One line per systemd unit (or a bash glob against it) currently in a
+# deliberate, controlled maintenance window - any project's own
+# deploy/maintenance.sh writes/removes its own unit names here so a planned
+# `systemctl stop` during a deploy never pages anyone. This is intentionally
+# a shared, cross-project file (this script itself watches every project on
+# the host, not just one) rather than each project inventing its own
+# skip-list convention.
+MAINTENANCE_UNITS_FILE="$CONF_DIR/maintenance_units.txt"
 
 install -d -m 700 "$DATA_DIR"
 touch "$STATE_FILE"
@@ -28,6 +36,17 @@ PY
     -H "Content-Type: application/json" -d "$payload" >/dev/null 2>&1 || true
 }
 
+unit_in_maintenance() {
+  local unit="$1" pattern
+  [[ -f "$MAINTENANCE_UNITS_FILE" ]] || return 1
+  while IFS= read -r pattern; do
+    [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+    # shellcheck disable=SC2053 - deliberate glob match, e.g. "madgamehunter-*"
+    [[ "$unit" == $pattern ]] && return 0
+  done < "$MAINTENANCE_UNITS_FILE"
+  return 1
+}
+
 # Ignore VMIDs (templates etc.)
 declare -A IGNORE
 if [[ -f "$IGNORE_VMIDS_FILE" ]]; then
@@ -46,6 +65,9 @@ TH_SWAP_SEC=$((30*60))
 TH_IOWAIT_SEC=$((60*60))
 TH_DISK_WARN_SEC=$((15*60))
 TH_DISK_CRIT_SEC=$((10*60))
+# A VM is down or its agent silent this long before paging: a Windows guest
+# rebooting for updates (or still installing) is quiet for minutes, not 10.
+TH_VM_SEC=$((10*60))
 
 state_get() {
   local m="$1"
@@ -87,13 +109,16 @@ while read -r VMID NAME STATUS _rest; do
   qm config "$VMID" 2>/dev/null | grep -q '^template: 1' && IS_TPL=1
   [[ "$IS_TPL" == "1" ]] && continue
 
+  not_running=0; agent_silent=0
   if [[ "$STATUS" != "running" ]]; then
-    alert "critical" "vm-not-running:${VMID}" "VM NOT RUNNING" "VMID=${VMID} name=${NAME} status=${STATUS}"
-  else
-    if ! timeout 3 qm agent "$VMID" ping >/dev/null 2>&1; then
-      alert "critical" "vm-agent-fail:${VMID}" "VM AGENT NO PING" "VMID=${VMID} name=${NAME}"
-    fi
+    not_running=1
+  elif ! timeout 3 qm agent "$VMID" ping >/dev/null 2>&1; then
+    agent_silent=1
   fi
+  maybe_alert "vm_not_running:${VMID}" "$not_running" "$TH_VM_SEC" critical \
+    "vm-not-running:${VMID}" "VM NOT RUNNING" "VMID=${VMID} name=${NAME} status=${STATUS}"
+  maybe_alert "vm_agent_silent:${VMID}" "$agent_silent" "$TH_VM_SEC" critical \
+    "vm-agent-fail:${VMID}" "VM AGENT NO PING" "VMID=${VMID} name=${NAME}"
 done < <(qm list 2>/dev/null | awk 'NR>1{print $1,$2,$3}')
 
 # ---------- RAID / mdstat ----------
@@ -181,11 +206,28 @@ maybe_alert "load_hi" "$load_hi" "$TH_LOAD_SEC" "warning" "load-high" "LOAD HIGH
 maybe_alert "idle_lo" "$idle_lo" "$TH_IDLE_SEC" "warning" "cpu-idle-low" "CPU IDLE LOW (30m)" "idle=${idle}% iowait=${iowait}%"
 maybe_alert "iow_hi"  "$iow_hi"  "$TH_IOWAIT_SEC" "warning" "iowait-high" "IO WAIT HIGH (60m)" "iowait=${iowait}%"
 
+declare -A FAILED_UNITS
 # ---------- systemd failed units ----------
+# One notification per continuous failed-unit incident. Reposting on every
+# server-watch tick edits the same Alert Bot incident hundreds of times and
+# can fan out into email spam; alert again only after the unit recovers and
+# subsequently fails (the state is cleared below once it leaves --failed).
 while read -r unit; do
   [[ -z "$unit" ]] && continue
-  alert "critical" "systemd-failed:${unit}" "SYSTEMD UNIT FAILED: ${unit}" ""
+  unit_in_maintenance "$unit" && continue
+  FAILED_UNITS["$unit"]=1
+  metric="systemd_failed_last:${unit}"
+  if [[ "$(state_get "$metric")" == "0" ]]; then
+    alert "critical" "systemd-failed:${unit}" "SYSTEMD UNIT FAILED: ${unit}" ""
+    state_set "$metric" "$now"
+  fi
 done < <(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+while IFS= read -r metric; do
+  unit="${metric#systemd_failed_last:}"
+  if [[ -z "${FAILED_UNITS[$unit]:-}" ]]; then
+    state_clear "$metric"
+  fi
+done < <(awk -F '\t' '$1 ~ /^systemd_failed_last:/ {print $1}' "$STATE_FILE")
 
 # ---------- Docker containers ----------
 if command -v docker >/dev/null 2>&1; then
@@ -220,20 +262,24 @@ maybe_alert "admin_panel_down" "$admin_panel_down" "$TH_ADMIN_PANEL_SEC" "critic
 # app.services.task_lock.HEARTBEAT_KEY_SUFFIX) - a stale/missing value here
 # means nobody is watching the other loops right now.
 TH_MGH_WATCHDOG_SEC=$((15*60))
-mgh_watchdog_stale=0
-mgh_hb_raw="$(docker exec madgamehunter_redis redis-cli -a "${MADGAMEHUNTER_REDIS_PASSWORD:-}" --no-auth-warning GET "watchdog:running_lock:heartbeat" 2>/dev/null)"
-if [[ -z "$mgh_hb_raw" ]]; then
-  mgh_watchdog_stale=1
+if unit_in_maintenance "madgamehunter-worker.service"; then
+  state_clear "mgh_watchdog_stale"
 else
-  mgh_hb_int="${mgh_hb_raw%.*}"
-  if [[ "$mgh_hb_int" =~ ^[0-9]+$ ]]; then
-    mgh_age=$(( $(date +%s) - mgh_hb_int ))
-    (( mgh_age > 300 )) && mgh_watchdog_stale=1
-  else
+  mgh_watchdog_stale=0
+  mgh_hb_raw="$(docker exec madgamehunter_redis redis-cli -a "${MADGAMEHUNTER_REDIS_PASSWORD:-}" --no-auth-warning GET "watchdog:running_lock:heartbeat" 2>/dev/null)"
+  if [[ -z "$mgh_hb_raw" ]]; then
     mgh_watchdog_stale=1
+  else
+    mgh_hb_int="${mgh_hb_raw%.*}"
+    if [[ "$mgh_hb_int" =~ ^[0-9]+$ ]]; then
+      mgh_age=$(( $(date +%s) - mgh_hb_int ))
+      (( mgh_age > 300 )) && mgh_watchdog_stale=1
+    else
+      mgh_watchdog_stale=1
+    fi
   fi
+  maybe_alert "mgh_watchdog_stale" "$mgh_watchdog_stale" "$TH_MGH_WATCHDOG_SEC" "critical" "madgamehunter-watchdog-stale" "MADGAMEHUNTER WATCHDOG SILENT (15m+)" "tasks.watchdog heartbeat missing/stale - nothing is monitoring the background loops right now, check madgamehunter-worker.service"
 fi
-maybe_alert "mgh_watchdog_stale" "$mgh_watchdog_stale" "$TH_MGH_WATCHDOG_SEC" "critical" "madgamehunter-watchdog-stale" "MADGAMEHUNTER WATCHDOG SILENT (15m+)" "tasks.watchdog heartbeat missing/stale - nothing is monitoring the background loops right now, check madgamehunter-worker.service"
 
 # ---------- Certbot cert expiry ----------
 if command -v certbot >/dev/null 2>&1; then
