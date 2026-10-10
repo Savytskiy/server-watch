@@ -121,6 +121,19 @@ while read -r VMID NAME STATUS _rest; do
     "vm-agent-fail:${VMID}" "VM AGENT NO PING" "VMID=${VMID} name=${NAME}"
 done < <(qm list 2>/dev/null | awk 'NR>1{print $1,$2,$3}')
 
+# ---------- nightly backup heartbeat ----------
+# backup.sh stamps /var/lib/server-backup/last_ok after each successful run.
+# Its own FAILED alert only fires when it runs; this catches it not running.
+BACKUP_STAMP=/var/lib/server-backup/last_ok
+BACKUP_MAX_AGE_SEC=$((30*60*60))
+if [[ -f "$BACKUP_STAMP" ]]; then
+  last_ok="$(cat "$BACKUP_STAMP" 2>/dev/null || echo 0)"
+  if (( now - last_ok > BACKUP_MAX_AGE_SEC )); then
+    alert "critical" "backup-stale" "BACKUP NOT RUNNING" \
+      "last successful backup $(( (now - last_ok) / 3600 ))h ago (check: systemctl status server-backup.timer)"
+  fi
+fi
+
 # ---------- RAID / mdstat ----------
 MD="$(cat /proc/mdstat 2>/dev/null || true)"
 while read -r mdline; do
