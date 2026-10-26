@@ -197,9 +197,18 @@ swap_f_kb="$(awk '/SwapFree/{print $2}' /proc/meminfo)"
 swap_u_kb="$((swap_t_kb - swap_f_kb))"
 
 mem_lo=0; (( memavail_kb < 3*1024*1024 )) && mem_lo=1
-swap_hi=0; (( swap_u_kb > 8*1024*1024 )) && swap_hi=1
+# Swap that is merely occupied (idle pages pushed out long ago) is harmless;
+# what hurts is the system reading it back in. Alert on a sustained swap-in
+# rate (~1 MB/s), or when swap fills a large share of RAM anyway.
+pswpin="$(awk '/^pswpin /{print $2}' /proc/vmstat)"
+now_ts="$(date +%s)"
+prev_pswpin="$(state_get swap_pswpin_last)"; prev_ts="$(state_get swap_ts_last)"
+state_set swap_pswpin_last "$pswpin"; state_set swap_ts_last "$now_ts"
+swapin_ps=0
+(( prev_ts > 0 && now_ts > prev_ts && pswpin >= prev_pswpin )) && swapin_ps=$(( (pswpin - prev_pswpin) / (now_ts - prev_ts) ))
+swap_hi=0; (( swapin_ps > 250 || swap_u_kb > 24*1024*1024 )) && swap_hi=1
 maybe_alert "mem_lo" "$mem_lo" "$TH_MEM_SEC" "warning" "ram-low" "RAM LOW (30m)" "MemAvailable=$((memavail_kb/1024))MB"
-maybe_alert "swap_hi" "$swap_hi" "$TH_SWAP_SEC" "warning" "swap-used" "SWAP USED (30m)" "SwapUsed=$((swap_u_kb/1024))MB"
+maybe_alert "swap_hi" "$swap_hi" "$TH_SWAP_SEC" "warning" "swap-pressure" "SWAP PRESSURE (30m)" "SwapUsed=$((swap_u_kb/1024))MB swap-in=${swapin_ps} pages/s"
 
 # ---------- Load / iowait ----------
 nproc_n="$(nproc)"
