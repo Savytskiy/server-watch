@@ -1,6 +1,6 @@
 # server-watch
 
-Host + VM health monitor for this box, alerting through a separate webhook-based alert router (alert-bot, private repo).
+Host + VM health monitor for this box, alerting through [alert-bot](https://github.com/Savytskiy/alert-bot).
 Runs as a `systemd` oneshot service on a 2-minute timer - deliberately a plain
 bash script outside any of the Python services it watches, so it keeps
 working even if one of them (including its own in-process equivalent,
