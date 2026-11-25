@@ -20,10 +20,11 @@ cp server-watch.sh /opt/server-watch/server-watch.sh
 cp systemd/*.service systemd/*.timer /etc/systemd/system/
 cp config.env.example /etc/server-watch/config.env   # then fill in real values, chmod 600
 cp ignore_vmids.txt.example /etc/server-watch/ignore_vmids.txt
+cp docker_ignore.txt.example /etc/server-watch/docker_ignore.txt   # optional: deliberately-stopped containers
 systemctl daemon-reload
 systemctl enable --now server-watch.timer
 ```
 
-`/etc/server-watch/config.env` and `/etc/server-watch/ignore_vmids.txt` hold
-real secrets/host-specific config - never committed here, only the
-`.example` templates.
+`/etc/server-watch/config.env`, `/etc/server-watch/ignore_vmids.txt` and
+`/etc/server-watch/docker_ignore.txt` hold real secrets/host-specific config
+- never committed here, only the `.example` templates.

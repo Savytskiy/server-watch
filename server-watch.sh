@@ -15,6 +15,14 @@ ENV_FILE="$CONF_DIR/config.env"
 # the host, not just one) rather than each project inventing its own
 # skip-list convention.
 MAINTENANCE_UNITS_FILE="$CONF_DIR/maintenance_units.txt"
+# One container name (or glob) per line that is deliberately stopped on
+# purpose - a one-off/experiment container left around, not a crash. Same
+# convention as MAINTENANCE_UNITS_FILE above, just for `docker ps -a` names
+# instead of systemd units. Added 2026-11-25 after bbs-gui-291 (a stopped
+# one-off experiment) produced thousands of identical "DOCKER CONTAINER
+# DOWN" critical alerts over several days - the docker check below had no
+# way to say "this one is expected to be exited".
+DOCKER_IGNORE_FILE="$CONF_DIR/docker_ignore.txt"
 
 install -d -m 700 "$DATA_DIR"
 touch "$STATE_FILE"
@@ -44,6 +52,17 @@ unit_in_maintenance() {
     # shellcheck disable=SC2053 - deliberate glob match, e.g. "madgamehunter-*"
     [[ "$unit" == $pattern ]] && return 0
   done < "$MAINTENANCE_UNITS_FILE"
+  return 1
+}
+
+container_ignored() {
+  local name="$1" pattern
+  [[ -f "$DOCKER_IGNORE_FILE" ]] || return 1
+  while IFS= read -r pattern; do
+    [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+    # shellcheck disable=SC2053 - deliberate glob match
+    [[ "$name" == $pattern ]] && return 0
+  done < "$DOCKER_IGNORE_FILE"
   return 1
 }
 
@@ -252,16 +271,36 @@ while IFS= read -r metric; do
 done < <(awk -F '\t' '$1 ~ /^systemd_failed_last:/ {print $1}' "$STATE_FILE")
 
 # ---------- Docker containers ----------
+declare -A SEEN_CONTAINER_METRICS
 if command -v docker >/dev/null 2>&1; then
   while IFS=$'\t' read -r name state status; do
     [[ -z "$name" ]] && continue
+    container_ignored "$name" && continue
     if [[ "$state" == "restarting" ]]; then
-      alert "critical" "docker-restart-loop:${name}" "DOCKER CONTAINER RESTART-LOOPING: ${name}" "status=${status}"
+      metric="docker_restart_loop_last:${name}"
+      SEEN_CONTAINER_METRICS["$metric"]=1
+      if [[ "$(state_get "$metric")" == "0" ]]; then
+        alert "critical" "docker-restart-loop:${name}" "DOCKER CONTAINER RESTART-LOOPING: ${name}" "status=${status}"
+        state_set "$metric" "$now"
+      fi
     elif [[ "$state" == "exited" && "$status" != *"Exited (0)"* ]]; then
-      alert "critical" "docker-down:${name}" "DOCKER CONTAINER DOWN (non-zero exit): ${name}" "status=${status}"
+      # One notification per continuous down-incident, same reasoning as the
+      # systemd-failed-units check above: this used to fire on every tick
+      # (every 2 min) forever for any non-zero exit, deliberate or not.
+      metric="docker_down_last:${name}"
+      SEEN_CONTAINER_METRICS["$metric"]=1
+      if [[ "$(state_get "$metric")" == "0" ]]; then
+        alert "critical" "docker-down:${name}" "DOCKER CONTAINER DOWN (non-zero exit): ${name}" "status=${status}"
+        state_set "$metric" "$now"
+      fi
     fi
   done < <(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}' 2>/dev/null)
 fi
+while IFS= read -r metric; do
+  if [[ -z "${SEEN_CONTAINER_METRICS[$metric]:-}" ]]; then
+    state_clear "$metric"
+  fi
+done < <(awk -F '\t' '$1 ~ /^docker_(down|restart_loop)_last:/ {print $1}' "$STATE_FILE")
 
 # ---------- Local HTTP services ----------
 TH_ADMIN_PANEL_SEC=90

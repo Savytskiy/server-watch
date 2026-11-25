@@ -1,0 +1,5 @@
+# One container name per line (or a bash glob, e.g. "bbs-gui-*") to exclude
+# from the "DOCKER CONTAINER DOWN"/"RESTART-LOOPING" checks - containers
+# that are deliberately stopped on purpose (a one-off experiment, a tool
+# left around but not meant to run continuously), not a crash to page about.
+# Real file lives at /etc/server-watch/docker_ignore.txt, not tracked in git.
